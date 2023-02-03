@@ -1,0 +1,276 @@
+variables:
+ - group: azurecredentials
+
+trigger:
+- master
+
+stages:
+- stage: Infrastructure
+  jobs:
+  - job: TerraformTasks
+    displayName: Terraform 
+    pool:
+      vmImage: 'ubuntu-20.04'
+
+    steps:
+    - task: DownloadSecureFile@1
+      displayName: Downloading conf file
+      name: azurecreds
+      inputs:
+        secureFile: 'azurecreds.conf'
+
+    # Install SSH Key for VM
+    - task: InstallSSHKey@0
+      displayName: Installing SSH key
+      inputs:
+        knownHostsEntry: 'known_hosts'
+        sshPublicKey: $(public_key)
+        sshKeySecureFile: 'id_rsa'
+
+    #Terraform Install
+    - task: TerraformInstaller@0
+      displayName:  Installtion
+      inputs:
+        terraformVersion: '1.0.1'
+
+    #Terraform Init
+    - task: TerraformTaskV2@2
+      displayName:  Initiation
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: '-backend-config=$(azurecreds.secureFilePath)'
+        backendServiceArm: 'azurerm-sc'
+        backendAzureRmResourceGroupName: 'tstate'
+        backendAzureRmStorageAccountName: 'tstate1605'
+        backendAzureRmContainerName: 'tstate'
+        backendAzureRmKey: 'test.terraform.tfstate'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/environments/test'
+
+
+    - task: AzureCLI@1
+      displayName:  Environment Variables 
+      inputs:
+        azureSubscription: azurerm-sc
+        scriptLocation: inlineScript
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/environments/test'
+        addSpnToEnvironment: true
+        inlineScript: |
+            export ARM_CLIENT_ID=$(client_id)
+            export ARM_CLIENT_SECRET=$(client_secret)
+            export ARM_SUBSCRIPTION_ID=$(subscription_id)
+            export ARM_TENANT_ID=$(tenant_id)
+    
+    #Terraform Apply
+    - task: TerraformTaskV2@2
+      displayName: Apply
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        commandOptions: '-auto-approve'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/environments/test'
+        environmentServiceNameAzureRM: 'azurerm-sc'
+
+- stage: Build
+  jobs:
+  - job: build_artifacts
+    displayName: Build Artifacts
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+    - task: ArchiveFiles@2
+      displayName: Archive FakeRestAPI
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/fakerestapi'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/fakerestapi-$(Build.BuildId).zip'
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish FakeRestAPI artifact
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/fakerestapi-$(Build.BuildId).zip'
+        artifactName: 'drop-fakerestapi'
+
+    - task: ArchiveFiles@2
+      displayName: Archive Selenium
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/automatedtesting/selenium'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/selenium-$(Build.BuildId).zip'
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Selenium artifact
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/selenium-$(Build.BuildId).zip'
+        artifactName: 'drop-selenium'
+
+- stage: Deploy
+  jobs:
+  - deployment: deploy_fakerestapi
+    displayName: Deploying FakeRestAPI
+    pool:
+      vmImage: 'ubuntu-20.04'
+    environment: 'test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureRmWebAppDeployment@4
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: 'azurerm-sc'
+              appType: 'webApp'
+              WebAppName: 'tqa-AppService'
+              packageForLinux: '$(Pipeline.Workspace)/drop-fakerestapi/fakerestapi-$(Build.BuildId).zip'
+              DeploymentType: zipDeploy
+
+  - deployment: VMDeploy
+    displayName: Deploy VM
+    pool:
+      vmImage: 'ubuntu-20.04'
+    environment: 'test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - bash: |
+              pwd
+              hostname
+              uname -a
+              cat /etc/*-release
+              sudo apt-get install software-properties-common -y
+              sudo apt-add-repository universe -y
+              sudo apt-get update -y
+              sudo apt-get install python3-pip -y
+              sudo apt-get install unzip -y
+              sudo apt-get install -y chromium-browser
+              sudo apt-get install -y chromium-chromedriver
+              python3 -m pip install --upgrade pip
+              pip3 install selenium
+              python3 -V
+              pip3 -V
+              /usr/bin/chromium-browser --version
+              /usr/bin/chromedriver --version
+              python3 -c "import selenium; print('Selenium Version:', selenium.__version__)"
+              # Install Log Analytics agent on Linux computers (only need to run once)
+              # wget https://raw.githubusercontent.com/Microsoft/OMS-Agent-for-Linux/master/installer/scripts/onboard_agent.sh
+              # sh onboard_agent.sh -w ${AZURE_LOG_ANALYTICS_ID} -s ${AZURE_LOG_ANALYTICS_PRIMARY_KEY}
+              # sudo /opt/microsoft/omsagent/bin/service_control restart ${AZURE_LOG_ANALYTICS_ID}
+            env:  # To use secret variables in a script, we must explicitly map them as environment variables.
+              AZURE_LOG_ANALYTICS_ID: $(AZURE_LOG_ANALYTICS_ID)
+              AZURE_LOG_ANALYTICS_PRIMARY_KEY: $(AZURE_LOG_ANALYTICS_PRIMARY_KEY)
+            displayName: Configure VM
+
+- stage: Test
+  jobs:
+  - deployment: test_vm
+    displayName: UI Test 
+    pool:
+      vmImage: 'ubuntu-20.04'
+    environment: 'test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - bash: |
+              cd $(Pipeline.Workspace)/drop-selenium
+              find . -type f ! -name 'selenium-$(Build.BuildId).zip' -delete  # delete everything except 'selenium-$(Build.BuildId).zip'
+              unzip -o selenium-$(Build.BuildId).zip
+              pwd
+              ls -la
+              sudo mkdir -p /var/log/selenium
+              sudo chmod 664 /var/log/selenium
+              sudo python3 -u selenium-test.py 2>&1 | sudo tee -a /var/log/selenium/selenium-test.log
+              # copy selenium log file to $(System.DefaultWorkingDirectory)/log/selenium/
+              cd $(System.DefaultWorkingDirectory)
+              mkdir -p log/selenium
+              pwd
+              sudo cp /var/log/selenium/selenium-test.log log/selenium/selenium-test.log
+              ls -la
+            displayName: Run selenium tests
+          - task: PublishPipelineArtifact@1
+            displayName: Publish selenium logs
+
+
+  - job: test_jmeter
+    displayName: Performance Testing
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+    - bash: |
+        sudo apt-get install openjdk-11-jre-headless -y
+        java -version
+        wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.4.tgz -O jmeter.tgz
+        tar xzvf jmeter.tgz
+        mkdir -p log/jmeter
+      displayName: Install JMeter
+    - bash: |
+        apache-jmeter-5.4/bin/jmeter -n -t automatedtesting/jmeter/stress-test.jmx \
+                                     -l log/jmeter/stress-test-result.csv \
+                                     -e -f -o log/jmeter/stress-test-html-report \
+                                     -j log/jmeter/jmeter-stress-test.log
+      displayName:  StressTest
+    - bash: |
+        apache-jmeter-5.4/bin/jmeter -n -t automatedtesting/jmeter/endurance-test.jmx \
+                                     -l log/jmeter/endurance-test-result.csv \
+                                     -e -f -o log/jmeter/endurance-test-html-report \
+                                     -j log/jmeter/jmeter-endurance-test.log
+      displayName:  EnduranceTest
+    - task: ArchiveFiles@2
+      displayName: Save JMeter Stress Test Report to Artifact
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/log/jmeter/stress-test-html-report'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(System.DefaultWorkingDirectory)/log/jmeter/stress-test-html-report-$(Build.BuildId).zip'
+        verbose: true
+    - task: ArchiveFiles@2
+      displayName: Save JMeter Endurance Test Report to Artifact
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/log/jmeter/endurance-test-html-report'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(System.DefaultWorkingDirectory)/log/jmeter/endurance-test-html-report-$(Build.BuildId).zip'
+        verbose: true
+    - task: PublishPipelineArtifact@1
+      displayName: Publish JMeter logs
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/log/jmeter'
+        artifactName: 'drop-jmeter-logs'
+
+  - job: TestNewman
+    displayName: Postman Test
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps: 
+    - task: NodeTool@0
+      displayName: Install Node v12.X
+      inputs:
+        versionSpec: '12.x'
+    - bash: |
+        npm install -g newman
+        mkdir -p log/newman
+      displayName: Install Newman CLI
+    - bash: |
+        newman run automatedtesting/postman/regressionTest.json \
+                   -e automatedtesting/postman/testingenvironment.json \
+                   --reporters cli,junit \
+                   --reporter-junit-export log/newman/regressionTestUdacity.xml \
+                   --suppress-exit-code
+      displayName: Run Regression Test
+    - bash: |
+        newman run automatedtesting/postman/validationTest.json \
+                   -e automatedtesting/postman/testingenvironment.json \
+                   --reporters cli,junit \
+                   --reporter-junit-export log/newman/validationTestUdacity.xml \
+                   --suppress-exit-code
+      displayName: Run Validation Test
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Newman logs
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/log/newman'
+        artifactName: 'drop-newman-logs'
+
+
